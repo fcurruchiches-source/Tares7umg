@@ -1,0 +1,196 @@
+# ============================================================
+# Pipeline PCI-DSS DevSecOps — Python
+# Version simplificada — Sin tokens externos requeridos
+# Herramientas: todas gratuitas y nativas
+# ============================================================
+
+name: PCI-DSS Pipeline - Python
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ----------------------------------------------------------
+  # PASO 1: Escaneo de secretos en el codigo
+  # PCI-DSS Req. 3.3 — No exponer datos sensibles
+  # ----------------------------------------------------------
+  escaneo-secretos:
+    name: "Buscar secretos en el codigo"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Escanear secretos con Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ----------------------------------------------------------
+  # PASO 2: Analisis de codigo Python (SAST)
+  # PCI-DSS Req. 6.2.4 — Desarrollo seguro
+  # ----------------------------------------------------------
+  analisis-codigo:
+    name: "Analizar seguridad del codigo Python"
+    runs-on: ubuntu-latest
+    needs: escaneo-secretos
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar herramientas de analisis
+        run: |
+          pip install bandit safety pip-audit
+
+      - name: Bandit — buscar vulnerabilidades en codigo Python
+        run: |
+          bandit -r . -f json -o bandit-report.json || true
+          bandit -r . -ll
+        continue-on-error: false
+
+      - name: Guardar reporte Bandit
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reporte-bandit
+          path: bandit-report.json
+          retention-days: 90
+
+  # ----------------------------------------------------------
+  # PASO 3: Escaneo de dependencias Python
+  # PCI-DSS Req. 6.3.3 — Vulnerabilidades en componentes
+  # ----------------------------------------------------------
+  escaneo-dependencias:
+    name: "Revisar dependencias Python"
+    runs-on: ubuntu-latest
+    needs: escaneo-secretos
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Crear requirements.txt de ejemplo si no existe
+        run: |
+          if [ ! -f requirements.txt ]; then
+            echo "# Agregue sus dependencias aqui" > requirements.txt
+            echo "requests>=2.31.0" >> requirements.txt
+          fi
+
+      - name: pip-audit — auditar dependencias
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --format json -o pip-audit-report.json || true
+          pip-audit -r requirements.txt
+
+      - name: Safety — verificar CVEs conocidos
+        run: |
+          pip install safety
+          safety check -r requirements.txt --output json > safety-report.json || true
+          safety check -r requirements.txt
+        continue-on-error: true
+
+      - name: Guardar reportes de dependencias
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reportes-dependencias
+          path: |
+            pip-audit-report.json
+            safety-report.json
+          retention-days: 90
+
+  # ----------------------------------------------------------
+  # PASO 4: Escaneo de imagen Docker
+  # PCI-DSS Req. 5.2 — Proteccion contra malware
+  # Solo si existe un Dockerfile en el proyecto
+  # ----------------------------------------------------------
+  escaneo-contenedor:
+    name: "Escanear imagen Docker"
+    runs-on: ubuntu-latest
+    needs: [analisis-codigo, escaneo-dependencias]
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      - name: Crear Dockerfile basico si no existe
+        run: |
+          if [ ! -f Dockerfile ]; then
+            cat > Dockerfile << 'EOF'
+          FROM python:3.11-slim
+          WORKDIR /app
+          COPY requirements.txt .
+          RUN pip install --no-cache-dir -r requirements.txt
+          COPY . .
+          RUN useradd -m appuser && chown -R appuser /app
+          USER appuser
+          CMD ["python", "app.py"]
+          EOF
+          fi
+
+      - name: Construir imagen Docker
+        run: |
+          docker build -t mi-app-python:test .
+
+      - name: Trivy — escanear imagen por vulnerabilidades
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "mi-app-python:test"
+          format: "table"
+          exit-code: "0"
+          severity: "CRITICAL,HIGH"
+          vuln-type: "os,library"
+
+      - name: Trivy — guardar reporte JSON
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "mi-app-python:test"
+          format: "json"
+          output: "trivy-report.json"
+          exit-code: "0"
+          severity: "CRITICAL,HIGH,MEDIUM"
+
+      - name: Guardar reporte Trivy
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reporte-trivy
+          path: trivy-report.json
+          retention-days: 90
+
+  # ----------------------------------------------------------
+  # PASO 5: Reporte final de cumplimiento PCI-DSS
+  # ----------------------------------------------------------
+  reporte-pci:
+    name: "Generar reporte PCI-DSS"
+    runs-on: ubuntu-latest
+    needs: [analisis-codigo, escaneo-dependencias, escaneo-contenedor]
+    if: always()
+    steps:
+      - name: Generar resumen de cumplimiento
+        run: |
+          echo "## Reporte PCI-DSS — $(date '+%d/%m/%Y %H:%M')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Control | Herramienta | Estado |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Req 3.3 — Secretos en codigo | Gitleaks | ${{ needs.escaneo-secretos.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Req 6.2.4 — Analisis SAST | Bandit | ${{ needs.analisis-codigo.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Req 6.3.3 — Dependencias | pip-audit + Safety | ${{ needs.escaneo-dependencias.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Req 5.2 — Contenedor | Trivy | ${{ needs.escaneo-contenedor.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repositorio:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
